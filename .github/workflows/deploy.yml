@@ -1,0 +1,97 @@
+name: Deploy AURELMAR
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-aurelmar
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PROD_HOST: 213.155.29.140
+      PROD_USER: root
+      DEPLOY_SHA: ${{ github.sha }}
+    steps:
+      - name: Configure SSH
+        env:
+          KZ_SSH_KEY: ${{ secrets.KZ_SSH_KEY }}
+          KZ_SSH_KNOWN_HOSTS: ${{ vars.KZ_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$KZ_SSH_KEY" || { echo '::error::Missing Secret KZ_SSH_KEY'; exit 1; }
+          test -n "$KZ_SSH_KNOWN_HOSTS" || { echo '::error::Missing Variable KZ_SSH_KNOWN_HOSTS'; exit 1; }
+          umask 077
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$KZ_SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$KZ_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh-keygen -l -f ~/.ssh/known_hosts > /dev/null
+
+      - name: Build, deploy and check AURELMAR
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o ConnectTimeout=15 \
+            "$PROD_USER@$PROD_HOST" "bash -se -- $DEPLOY_SHA" <<'REMOTE'
+          set -euo pipefail
+          umask 022
+          export CI=true
+          deploy_sha=$1
+          cd /opt/aurelmar
+          test "$(node --version)" = v22.23.2 || { echo 'Expected Node.js 22.23.2'; exit 1; }
+          test "$(pnpm --version)" = 12.3.4 || { echo 'Expected pnpm 12.3.4'; exit 1; }
+          git fetch origin main
+          git merge-base --is-ancestor "$deploy_sha" origin/main
+
+          # Build outside the live checkout: a failed build leaves its code,
+          # dependencies and .next untouched. No git clean or env replacement.
+          build_dir=$(mktemp -d /opt/aurelmar-build.XXXXXX)
+          trap 'rm -rf -- "$build_dir"' EXIT
+          git archive "$deploy_sha" | tar -x -C "$build_dir"
+          for env_file in .env .env.local .env.production .env.production.local; do
+            if [ -f "$env_file" ]; then
+              cp -p -- "$env_file" "$build_dir/$env_file"
+            fi
+          done
+          (
+            cd "$build_dir"
+            pnpm install --frozen-lockfile
+            pnpm exec tsc --noEmit
+            pnpm build
+            test -s .next/BUILD_ID
+          )
+
+          # All validation succeeded. Promote the build on the same filesystem.
+          git reset --hard "$deploy_sha"
+          if [ -e node_modules ]; then mv node_modules "$build_dir/previous-node_modules"; fi
+          mv "$build_dir/node_modules" node_modules
+          if [ -e .next ]; then mv .next "$build_dir/previous-next"; fi
+          mv "$build_dir/.next" .next
+          systemctl restart aurelmar.service
+          systemctl is-active --quiet aurelmar
+          for attempt in {1..15}; do
+            status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --connect-timeout 2 --max-time 5 http://127.0.0.1:3280/ || true)
+            if [ "$status" = 200 ]; then
+              systemctl is-active --quiet aurelmar
+              echo "AURELMAR $deploy_sha: active, HTTP 200"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo 'AURELMAR did not return HTTP 200 on 127.0.0.1:3280' >&2
+          exit 1
+          REMOTE
+
+      - name: Remove runner SSH files
+        if: always()
+        run: rm -f ~/.ssh/deploy_key ~/.ssh/known_hosts
